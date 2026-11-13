@@ -115,3 +115,15 @@ SYSTEM account can. So this option installs a small Windows service named
   updating KeyShare,** it says the helper is out of date: click **Update it**
   (one admin prompt) so the service gets the new version too.
 - Untick the box to remove the service and its files.
+
+## If the mouse freezes
+
+KeyShare's keyboard and mouse hook runs on its own high-priority thread, and the
+clipboard, logging and network all run elsewhere, so none of them can hold up
+the mouse. If the network to the other PC gets stuck (Wi-Fi power saving, a VPN
+reconnecting), KeyShare notices within about 2.5 seconds and brings the mouse
+back to the sharing PC instead of leaving it frozen, then reconnects by itself.
+
+If a freeze still happens, the log (`%APPDATA%\KeyShare\log.txt`) on the
+sharing PC says what was stuck and for how long ("… was stuck for 28.4 s", or
+"Link to … stalled"). Send those lines along with a bug report.

@@ -240,7 +240,7 @@ internal static class InputSink
         set
         {
             _locked = value;
-            if (value) Log.Info(TryConnect() ? "Locked: passing input to the lock-screen helper" : "Locked, but the lock-screen helper isn't reachable");
+            if (value) Task.Run(() => Log.Info(TryConnect() ? "Locked: passing input to the lock-screen helper" : "Locked, but the lock-screen helper isn't reachable"));
         }
     }
 

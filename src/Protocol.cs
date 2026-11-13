@@ -16,7 +16,8 @@ internal enum Msg : byte
     Enter = 5,    // host -> client: byte center, byte side, float position along the edge (0..1)
     Leave = 6,    // host -> client: control went back to the host
     Return = 7,   // client -> host: float position along the edge (0..1)
-    Ping = 8,     // either way, keeps the link alive
+    Ping = 8,     // either way, every second: uint32 number. Answered with Pong.
+    Pong = 11,    // answer to Ping: the same number. Shows the link is really moving.
     Clip = 9,     // either way: one chunk of clipboard contents (see ClipboardSync)
     Activity = 10, // either way: "someone is using me", so the other PC doesn't time out
     Hello = 0x10, // handshake: UTF-8 machine name
@@ -29,8 +30,10 @@ internal static class Protocol
     public static readonly byte[] DiscoverQuery = "KSDISCOVER1"u8.ToArray();
     public const string DiscoverReplyPrefix = "KSHOST1|";
 
-    public static readonly byte[] Ping = [(byte)Msg.Ping];
     public static readonly byte[] Leave = [(byte)Msg.Leave];
+
+    public static byte[] Ping(uint n) { var b = new byte[5]; b[0] = (byte)Msg.Ping; BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(1), n); return b; }
+    public static byte[] Pong(byte[] ping) { var b = (byte[])ping.Clone(); b[0] = (byte)Msg.Pong; return b; }
     public static readonly byte[] Activity = [(byte)Msg.Activity];
 
     public static byte[] Move(int dx, int dy)

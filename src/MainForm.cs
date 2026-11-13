@@ -141,6 +141,7 @@ internal sealed class MainForm : Form
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) Hide(); };
 
         UpdateUi();
+        StallMonitor.Watch("window thread", a => { if (IsHandleCreated) BeginInvoke(a); else a(); }, () => IsDisposed);
     }
 
     private void BuildLayout()
@@ -266,8 +267,9 @@ internal sealed class MainForm : Form
         try
         {
             var host = new HostService(_settings.HostCode);
-            var capture = new InputCapture(() => host.IsConnected, host.Send) { OtherSide = _settings.OtherSide, SwitchKey = _settings.SwitchKey };
+            var capture = new InputCapture(() => host.IsUsable, host.Send) { OtherSide = _settings.OtherSide, SwitchKey = _settings.SwitchKey };
             capture.ReturnedByKey += () => OnUi(CursorLocator.ShowAtCursor);
+            capture.HooksFailed += _ => OnUi(() => SetStatus("Lost the keyboard and mouse hooks. Click Stop sharing, then Start sharing."));
             host.Status += s => OnUi(() => SetStatus(s));
             host.Connected += name => OnUi(() =>
             {
@@ -278,6 +280,19 @@ internal sealed class MainForm : Form
             {
                 _capture?.ForceLocal();
                 SetStatus("The other PC disconnected. Waiting for it to come back…");
+            });
+            host.StallChanged += (name, stalled) => OnUi(() =>
+            {
+                if (stalled)
+                {
+                    // Bring the mouse home rather than leave it frozen on both PCs.
+                    _capture?.ReturnToLocal(-1, tellOther: true);
+                    SetStatus($"The connection to {name} is stuck (Wi-Fi or VPN?). The mouse is back here; it'll reconnect by itself.");
+                }
+                else
+                {
+                    SetStatus($"Connected to {name}. Move the mouse to the {SideWord()} edge to control it.");
+                }
             });
             host.ReturnRequested += along => OnUi(() => _capture?.ReturnToLocal(along, tellOther: false));
             host.ClipboardChunk += ReceiveClipboard;
@@ -432,11 +447,14 @@ internal sealed class MainForm : Form
             _lnkUpdateUnlock.Visible = false;
             return;
         }
-        bool ready = InputSink.TryConnect();
-        _lnkUpdateUnlock.Visible = _unlockOutOfDate;
-        _lblUnlock.Text = _unlockOutOfDate ? "The lock-screen helper is out of date."
-            : ready ? "Ready: you can type on this PC's lock screen."
-            : "The lock-screen helper isn't responding. Untick and tick the box to restart it.";
+        _ = Task.Run(InputSink.TryConnect).ContinueWith(t => OnUi(() =>
+        {
+            bool ready = t.IsCompletedSuccessfully && t.Result;
+            _lnkUpdateUnlock.Visible = _unlockOutOfDate;
+            _lblUnlock.Text = _unlockOutOfDate ? "The lock-screen helper is out of date."
+                : ready ? "Ready: you can type on this PC's lock screen."
+                : "The lock-screen helper isn't responding. Untick and tick the box to restart it.";
+        }), TaskScheduler.Default);
     }
 
     // ---- Switch key ----------------------------------------------------------
@@ -529,7 +547,8 @@ internal sealed class MainForm : Form
             _capture?.Toggle();
             return;
         }
-        if (m.Msg == Native.WM_CLIPBOARDUPDATE && Environment.TickCount64 >= _ignoreClipboardUntil)
+        if (m.Msg == Native.WM_CLIPBOARDUPDATE && Volatile.Read(ref _settingClipboard) == 0 &&
+            Environment.TickCount64 >= Interlocked.Read(ref _ignoreClipboardUntil))
         {
             // Apps often update the clipboard several times in a row; send once it settles.
             _clipTimer.Stop();
@@ -537,6 +556,10 @@ internal sealed class MainForm : Form
         }
         base.WndProc(ref m);
     }
+
+    private int _clipboardBusy;        // a read is running
+    private bool _clipboardReadAgain;  // another copy happened meanwhile
+    private int _settingClipboard;     // we are putting the other PC's copy on the clipboard
 
     private void SendClipboard()
     {
@@ -547,21 +570,26 @@ internal sealed class MainForm : Form
         else if (_client is { IsConnected: true } c) send = c.SendBulk;
         if (send == null) return;
 
-        string? text, rtf;
-        Image? image;
-        try { (text, rtf, image) = ClipboardSync.Read(); }
-        catch (Exception ex) { Log.Error("Reading clipboard", ex); return; }
-
-        _ = Task.Run(() =>
+        if (Interlocked.Exchange(ref _clipboardBusy, 1) == 1) { _clipboardReadAgain = true; return; }
+        _ = StaWorker.Run("Reading clipboard", () =>
         {
+            var (text, rtf, image) = ClipboardSync.Read();
             try
             {
                 var chunks = _clip.Pack(text, rtf, image);
                 if (chunks != null) foreach (var chunk in chunks) send(chunk);
             }
-            catch (Exception ex) { Log.Error("Sending clipboard", ex); }
             finally { image?.Dispose(); }
-        });
+        }, TimeSpan.FromSeconds(10)).ContinueWith(_ =>
+        {
+            Interlocked.Exchange(ref _clipboardBusy, 0);
+            OnUi(() =>
+            {
+                if (!_clipboardReadAgain) return;
+                _clipboardReadAgain = false;
+                _clipTimer.Start();
+            });
+        }, TaskScheduler.Default);
     }
 
     /// <summary>Called on a network thread for each clipboard chunk from the other PC.</summary>
@@ -574,12 +602,13 @@ internal sealed class MainForm : Form
         {
             _clip.NoteReceived(bundle);
             var (text, rtf, image) = ClipboardSync.Unpack(bundle);
-            OnUi(() =>
-            {
-                _ignoreClipboardUntil = Environment.TickCount64 + 1000; // don't echo it back
-                try { ClipboardSync.Set(text, rtf, image); }
-                catch (Exception ex) { Log.Error("Setting clipboard", ex); }
-            });
+            Interlocked.Increment(ref _settingClipboard); // don't send it straight back
+            _ = StaWorker.Run("Setting clipboard", () => ClipboardSync.Set(text, rtf, image), TimeSpan.FromSeconds(10))
+                .ContinueWith(_ =>
+                {
+                    Interlocked.Exchange(ref _ignoreClipboardUntil, Environment.TickCount64 + 1000);
+                    Interlocked.Decrement(ref _settingClipboard);
+                }, TaskScheduler.Default);
         }
         catch (Exception ex)
         {

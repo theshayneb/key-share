@@ -21,11 +21,13 @@ internal sealed class WrongCodeException(string message) : Exception(message);
 /// </summary>
 internal sealed class SecureLink : IDisposable
 {
-    private static readonly byte[] Magic = "KSH2"u8.ToArray();
+    private static readonly byte[] Magic = "KSH3"u8.ToArray();
     private const int TagSize = 16;
     private const int MaxFrame = ushort.MaxValue;
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(8);
-    private static readonly TimeSpan PingEvery = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PingEvery = TimeSpan.FromSeconds(1);
+    /// <summary>No answer to our pings for this long: the network is stuck (Wi-Fi, VPN…).</summary>
+    private static readonly TimeSpan StallAfter = TimeSpan.FromSeconds(2.5);
 
     private readonly TcpClient _tcp;
     private readonly NetworkStream _stream;
@@ -37,6 +39,13 @@ internal sealed class SecureLink : IDisposable
     private readonly Channel<byte[]> _bulk = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
     private readonly CancellationTokenSource _cts = new();
     private long _lastReceive = Environment.TickCount64;
+    private long _lastPong = Environment.TickCount64;
+    private uint _pingNumber;
+    private bool _stalled;
+
+    /// <summary>Raised (on a background thread) when the link gets stuck and when it recovers.</summary>
+    public event Action<bool>? StallChanged;
+    public bool IsStalled => _stalled;
     private int _disposed;
 
     public string PeerName { get; private set; } = "";
@@ -199,7 +208,9 @@ internal sealed class SecureLink : IDisposable
             {
                 var msg = await ReadFrameAsync(ct);
                 Interlocked.Exchange(ref _lastReceive, Environment.TickCount64);
-                if (msg.Length == 0 || msg[0] == (byte)Msg.Ping) continue;
+                if (msg.Length == 0) continue;
+                if (msg[0] == (byte)Msg.Ping) { Send(Protocol.Pong(msg)); continue; }
+                if (msg[0] == (byte)Msg.Pong) { Interlocked.Exchange(ref _lastPong, Environment.TickCount64); continue; }
                 try { onMessage(msg); }
                 catch (Exception ex) { Log.Error("Handling message", ex); }
             }
@@ -234,11 +245,7 @@ internal sealed class SecureLink : IDisposable
                 wait.Cancel(); // release whichever wait is still pending
                 if (ct.IsCancellationRequested) break;
                 bool ready = (a1.IsCompletedSuccessfully && a1.Result) || (a2.IsCompletedSuccessfully && a2.Result);
-                if (!ready)
-                {
-                    if (a1.IsCompletedSuccessfully && a2.IsCompletedSuccessfully) break; // both closed
-                    await WriteFrameAsync(Protocol.Ping, ct); // idle: keep the link alive
-                }
+                if (!ready && a1.IsCompletedSuccessfully && a2.IsCompletedSuccessfully) break; // both closed
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException or SocketException)
@@ -254,10 +261,27 @@ internal sealed class SecureLink : IDisposable
     {
         try
         {
+            long lastPing = 0;
+            Interlocked.Exchange(ref _lastPong, Environment.TickCount64);
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(1000, ct);
-                if (Environment.TickCount64 - Interlocked.Read(ref _lastReceive) > IdleTimeout.TotalMilliseconds)
+                await Task.Delay(250, ct);
+                long now = Environment.TickCount64;
+                if (now - lastPing >= PingEvery.TotalMilliseconds)
+                {
+                    Send(Protocol.Ping(unchecked(++_pingNumber))); // ahead of any queued clipboard data
+                    lastPing = now;
+                }
+
+                bool stalled = now - Interlocked.Read(ref _lastPong) > StallAfter.TotalMilliseconds;
+                if (stalled != _stalled)
+                {
+                    _stalled = stalled;
+                    Log.Info(stalled ? $"Link to {PeerName} stalled: no answer for {StallAfter.TotalSeconds} s" : $"Link to {PeerName} recovered");
+                    try { StallChanged?.Invoke(stalled); } catch (Exception ex) { Log.Error("Stall handler", ex); }
+                }
+
+                if (now - Interlocked.Read(ref _lastReceive) > IdleTimeout.TotalMilliseconds)
                 {
                     Log.Info($"Link to {PeerName} timed out");
                     return;

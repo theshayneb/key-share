@@ -24,6 +24,9 @@ internal sealed class HostService : IDisposable
     public HostService(string code) => _code = code;
 
     public bool IsConnected => Volatile.Read(ref _current) != null;
+    /// <summary>Connected and the link is actually moving (not stuck on a network hiccup).</summary>
+    public bool IsUsable => Volatile.Read(ref _current) is { IsStalled: false };
+    public event Action<string, bool>? StallChanged; // peer name, stalled
 
     public void Send(byte[] message) => Volatile.Read(ref _current)?.Send(message);
     public void SendBulk(byte[] message) => Volatile.Read(ref _current)?.SendBulk(message);
@@ -78,6 +81,7 @@ internal sealed class HostService : IDisposable
     {
         var old = Interlocked.Exchange(ref _current, link);
         old?.Dispose();
+        link.StallChanged += stalled => { if (Volatile.Read(ref _current) == link) StallChanged?.Invoke(link.PeerName, stalled); };
         link.Start(OnMessage);
         Log.Info($"Connected to {link.PeerName} ({link.PeerAddress})");
         Connected?.Invoke(link.PeerName);

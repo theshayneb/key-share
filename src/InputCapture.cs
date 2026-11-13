@@ -7,9 +7,12 @@ namespace KeyShare;
 /// Global keyboard and mouse hooks on the host. While control is on the other
 /// PC, local input is swallowed and forwarded instead.
 ///
-/// Must be created on the UI thread: low-level hooks are called on the thread
-/// that installed them, through its message loop. Callbacks only do a few
-/// array operations and queue a message, so Windows never times them out.
+/// Windows waits for a low-level hook before every single mouse move and key,
+/// on every app. So the hooks live on their own high-priority thread that does
+/// nothing else: if anything in KeyShare is slow (the window, the clipboard, a
+/// disk), the mouse doesn't notice. Callbacks only update a few arrays and queue
+/// a message. Public methods may be called from any thread; they are run on the
+/// hook thread.
 /// </summary>
 internal sealed class InputCapture : IDisposable
 {
@@ -22,8 +25,12 @@ internal sealed class InputCapture : IDisposable
     private readonly HookProc _keyProc, _mouseProc; // held in fields so the GC never collects them
     private IntPtr _keyHook, _mouseHook;
 
-    private bool _remote;
+    private volatile bool _remote;
     private POINT _park;
+
+    private readonly Thread _thread;
+    private Control? _invoker; // created on the hook thread, used to run work there
+    private Exception? _startError;
 
     // Which side got the "down" of each key and button, so the matching "up"
     // goes to the same side even if control switched in between. That is what
@@ -32,8 +39,12 @@ internal sealed class InputCapture : IDisposable
     private readonly bool[] _keyDown = new bool[256];
     private readonly byte[] _buttonOwner = new byte[5];
 
-    public Side OtherSide { get; set; } = Side.Right;
-    public SwitchKey SwitchKey { get; set; } = SwitchKey.Default;
+    private volatile SwitchKey _switchKey = SwitchKey.Default;
+    private volatile int _otherSide = (int)Side.Right;
+    public Side OtherSide { get => (Side)_otherSide; set => _otherSide = (int)value; }
+    public SwitchKey SwitchKey { get => _switchKey; set => _switchKey = value; }
+    /// <summary>Installing the hooks failed after a wake or unlock.</summary>
+    public event Action<Exception>? HooksFailed;
     /// <summary>The cursor came back to this PC by the switch key (so it may be hard to spot).</summary>
     public event Action? ReturnedByKey;
     public bool IsRemote => _remote;
@@ -45,7 +56,42 @@ internal sealed class InputCapture : IDisposable
         _send = send;
         _keyProc = KeyboardProc;
         _mouseProc = MouseProc;
-        Install();
+
+        using var started = new ManualResetEventSlim();
+        _thread = new Thread(() => HookThread(started)) { IsBackground = true, Name = "input hooks", Priority = ThreadPriority.Highest };
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+        started.Wait();
+        if (_startError != null) throw _startError;
+        StallMonitor.Watch("input hook thread", a => Post(a), () => _invoker == null);
+    }
+
+    private void HookThread(ManualResetEventSlim started)
+    {
+        try
+        {
+            _invoker = new Control();
+            _invoker.CreateControl();
+            Install();
+        }
+        catch (Exception ex)
+        {
+            _startError = ex;
+            started.Set();
+            return;
+        }
+        started.Set();
+        Application.Run(); // the message loop the hooks are called through
+        Uninstall();
+        _invoker.Dispose();
+        _invoker = null;
+    }
+
+    /// <summary>Runs <paramref name="action"/> on the hook thread.</summary>
+    private void Post(Action action)
+    {
+        try { _invoker?.BeginInvoke(action); }
+        catch (InvalidOperationException) { } // shutting down
     }
 
     private void Install()
@@ -56,7 +102,7 @@ internal sealed class InputCapture : IDisposable
         if (_keyHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
         {
             int err = Marshal.GetLastWin32Error();
-            Dispose();
+            Uninstall();
             throw new InvalidOperationException($"Could not install input hooks (error {err}).");
         }
     }
@@ -65,11 +111,19 @@ internal sealed class InputCapture : IDisposable
     /// Puts the hooks back. Windows silently drops a hook that is slow to answer,
     /// which can happen while the PC wakes up, so this runs after sleep and unlock.
     /// </summary>
-    public void Reinstall()
+    public void Reinstall() => Post(() =>
     {
-        Dispose();
-        Install();
-    }
+        try
+        {
+            Uninstall();
+            Install();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Reinstalling hooks", ex);
+            HooksFailed?.Invoke(ex);
+        }
+    });
 
     // ---- Switching ------------------------------------------------------
 
@@ -86,7 +140,9 @@ internal sealed class InputCapture : IDisposable
     }
 
     /// <summary>Gives control back to this PC. <paramref name="along"/> &lt; 0 puts the cursor in the middle.</summary>
-    public void ReturnToLocal(float along, bool tellOther)
+    public void ReturnToLocal(float along, bool tellOther) => Post(() => ReturnToLocalCore(along, tellOther));
+
+    private void ReturnToLocalCore(float along, bool tellOther)
     {
         if (!_remote) return;
         _remote = false;
@@ -122,16 +178,18 @@ internal sealed class InputCapture : IDisposable
     }
 
     /// <summary>The link dropped: take control back without talking to the other PC.</summary>
-    public void ForceLocal()
+    public void ForceLocal() => Post(() =>
     {
-        if (_remote) ReturnToLocal(-1, tellOther: false);
+        if (_remote) ReturnToLocalCore(-1, tellOther: false);
         for (int i = 0; i < _keyOwner.Length; i++) if (_keyOwner[i] == Remote) _keyOwner[i] = None;
         for (int i = 0; i < _buttonOwner.Length; i++) if (_buttonOwner[i] == Remote) _buttonOwner[i] = None;
-    }
+    });
 
-    public void Toggle()
+    public void Toggle() => Post(ToggleCore);
+
+    private void ToggleCore()
     {
-        if (_remote) ReturnToLocal(-1, tellOther: true);
+        if (_remote) ReturnToLocalCore(-1, tellOther: true);
         else if (_isConnected()) EnterRemote(center: true, 0.5f);
         else Log.Info("Switch key pressed, but the other PC isn't connected");
     }
@@ -237,7 +295,7 @@ internal sealed class InputCapture : IDisposable
         {
             _buttonOwner[index] = Swallow; // and its release goes nowhere too
             Log.Info($"Switch key ({SwitchKey}) pressed");
-            Toggle();
+            ToggleCore();
             return true;
         }
         if (_buttonOwner[index] == Swallow)
@@ -281,7 +339,7 @@ internal sealed class InputCapture : IDisposable
             _keyOwner[vk] = Swallow;
             _keyDown[vk] = true;
             Log.Info($"Switch key ({SwitchKey}) pressed");
-            Toggle();
+            ToggleCore();
             return true;
         }
 
@@ -307,9 +365,16 @@ internal sealed class InputCapture : IDisposable
         return held == SwitchKey.Mods;
     }
 
-    public void Dispose()
+    private void Uninstall()
     {
         if (_keyHook != IntPtr.Zero) { UnhookWindowsHookEx(_keyHook); _keyHook = IntPtr.Zero; }
         if (_mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
+    }
+
+    public void Dispose()
+    {
+        if (!_thread.IsAlive) return;
+        Post(Application.ExitThread); // ends the loop; the thread then unhooks
+        if (Thread.CurrentThread != _thread) _thread.Join(2000);
     }
 }

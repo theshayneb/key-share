@@ -82,6 +82,9 @@ internal sealed class ClientService : IDisposable
                     everConnected = true;
                     Status?.Invoke($"Connected to {link.PeerName}");
                     Log.Info($"Connected to {link.PeerName} ({link.PeerAddress})");
+                    link.StallChanged += stalled => Status?.Invoke(stalled
+                        ? $"The connection to {link.PeerName} is stuck (Wi-Fi or VPN?). Waiting for it…"
+                        : $"Connected to {link.PeerName}");
                     _link = link;
                     _injector.RequestReturn = along => link.Send(Protocol.Return(along));
                     link.Start(m =>
