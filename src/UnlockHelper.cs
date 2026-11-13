@@ -47,11 +47,12 @@ internal static class UnlockHelper
     private static bool _locked;
     private static long _lockCheckedAt;
 
-    public static void Run()
+    public static void Run(int servicePid)
     {
         using var single = new Mutex(true, @"Local\KeyShare-unlock-helper", out bool first);
         if (!first) return;
         Log.Info("Unlock helper started");
+        QuitWhenServiceStops(servicePid);
 
         // The main thread is STA, and COM gives STA threads a hidden window.
         // Windows refuses to move a thread that owns a window to another desktop
@@ -61,6 +62,22 @@ internal static class UnlockHelper
         worker.SetApartmentState(ApartmentState.MTA);
         worker.Start();
         worker.Join();
+    }
+
+    /// <summary>Exits as soon as the service that started us is gone, so no helper outlives it.</summary>
+    private static void QuitWhenServiceStops(int servicePid)
+    {
+        if (servicePid <= 0) return; // started without a service id: nothing to watch
+        Process service;
+        try { service = Process.GetProcessById(servicePid); }
+        catch (ArgumentException) { Log.Info("Unlock helper: service not running; quitting"); Log.Flush(); Environment.Exit(0); return; }
+        new Thread(() =>
+        {
+            service.WaitForExit();
+            Log.Info("Unlock helper: service stopped; quitting");
+            Log.Flush();
+            Environment.Exit(0);
+        }) { IsBackground = true, Name = "service watch" }.Start();
     }
 
     private static void ServeLoop()

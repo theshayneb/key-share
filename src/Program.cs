@@ -7,7 +7,12 @@ internal static class Program
     {
         // Lock-screen typing (see UnlockService). These run without the tray app.
         if (args.Contains("--service")) { System.ServiceProcess.ServiceBase.Run(new UnlockServiceHost()); return; }
-        if (args.Contains("--unlock-helper")) { UnlockHelper.Run(); return; }
+        if (args.Contains("--unlock-helper"))
+        {
+            int at = Array.IndexOf(args, "--unlock-helper");
+            UnlockHelper.Run(at + 1 < args.Length && int.TryParse(args[at + 1], out int service) ? service : 0);
+            return;
+        }
         if (args.Contains("--install-service")) { Environment.ExitCode = UnlockService.InstallFromCommandLine(); return; }
         if (args.Contains("--uninstall-service")) { Environment.ExitCode = UnlockService.UninstallFromCommandLine(); return; }
 

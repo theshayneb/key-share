@@ -76,10 +76,12 @@ internal static class UnlockService
         try
         {
             StopIfRunning();
+            StopLeftoverHelpers();
             Directory.CreateDirectory(InstallDir);
+            DeleteOldCopies();
             string source = Environment.ProcessPath!;
             if (!string.Equals(Path.GetFullPath(source), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase))
-                CopyWithRetry(source, InstalledExe);
+                ReplaceFile(source, InstalledExe);
 
             string binPath = $"binPath= \"\\\"{InstalledExe}\\\" --service\"";
             if (IsInstalled()) Sc($"config {Name} {binPath} start= auto");
@@ -106,12 +108,11 @@ internal static class UnlockService
         try
         {
             StopIfRunning();
+            StopLeftoverHelpers();
             if (IsInstalled()) Sc($"delete {Name}");
-            for (int i = 0; i < 20 && File.Exists(InstalledExe); i++)
-            {
-                try { File.Delete(InstalledExe); }
-                catch (Exception) when (i < 19) { Thread.Sleep(250); }
-            }
+            DeleteOldCopies();
+            if (File.Exists(InstalledExe) && !TryDelete(InstalledExe, attempts: 8))
+                ScheduleDeleteAtRestart(InstalledExe); // still in use: Windows removes it at the next restart
             try { Directory.Delete(InstallDir); } catch { }
             Log.Info("Unlock service removed");
             return 0;
@@ -134,14 +135,77 @@ internal static class UnlockService
         Thread.Sleep(500); // let the helper process exit and release the exe
     }
 
-    private static void CopyWithRetry(string from, string to)
+    /// <summary>
+    /// Ends any helper still running from the installed copy. Normally stopping
+    /// the service ends its helper, but one can be left behind (for example after
+    /// the service restarted), and it keeps the exe locked.
+    /// </summary>
+    private static void StopLeftoverHelpers()
     {
-        for (int i = 0; ; i++)
+        try { Process.EnterDebugMode(); } catch { } // lets an administrator end SYSTEM processes
+        foreach (var p in Process.GetProcessesByName("KeyShare"))
         {
-            try { File.Copy(from, to, overwrite: true); return; }
-            catch (IOException) when (i < 20) { Thread.Sleep(250); }
+            using (p)
+            {
+                if (p.Id == Environment.ProcessId) continue;
+                string? path = null;
+                try { path = p.MainModule?.FileName; } catch { }
+                if (path == null || !string.Equals(Path.GetFullPath(path), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try
+                {
+                    p.Kill();
+                    p.WaitForExit(5000);
+                    Log.Info($"Ended a leftover lock-screen helper (process {p.Id})");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"Ending leftover helper {p.Id}", ex);
+                }
+            }
         }
     }
+
+    /// <summary>
+    /// Copies <paramref name="from"/> over <paramref name="to"/>. If something
+    /// still has the old file open, moves it aside first: Windows lets you
+    /// rename a file that's in use, just not overwrite it.
+    /// </summary>
+    private static void ReplaceFile(string from, string to)
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            try { File.Copy(from, to, overwrite: true); return; }
+            catch (IOException) { Thread.Sleep(250); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(250); }
+        }
+        string aside = Path.Combine(InstallDir, $"KeyShare.old-{DateTime.Now:yyyyMMddHHmmss}.exe");
+        File.Move(to, aside);
+        ScheduleDeleteAtRestart(aside);
+        File.Copy(from, to, overwrite: true);
+        Log.Info("Installed copy was in use; moved it aside to replace it");
+    }
+
+    private static void DeleteOldCopies()
+    {
+        if (!Directory.Exists(InstallDir)) return;
+        foreach (var old in Directory.GetFiles(InstallDir, "KeyShare.old-*.exe")) TryDelete(old, attempts: 1);
+    }
+
+    private static bool TryDelete(string path, int attempts)
+    {
+        for (int i = 0; i < attempts; i++)
+        {
+            try { File.Delete(path); return true; }
+            catch (Exception) { Thread.Sleep(250); }
+        }
+        return false;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool MoveFileEx(string existing, string? replacement, int flags);
+
+    private static void ScheduleDeleteAtRestart(string path) => MoveFileEx(path, null, 4 /* MOVEFILE_DELAY_UNTIL_REBOOT */);
 
     private static void Sc(string arguments)
     {
@@ -217,7 +281,8 @@ internal sealed class UnlockServiceHost : ServiceBase
             if (!SetTokenInformation(dup, TokenSessionId, ref session, sizeof(uint))) throw new Win32Exception();
 
             string exe = Environment.ProcessPath!;
-            var cmd = new StringBuilder($"\"{exe}\" --unlock-helper");
+            // The helper watches this process and quits when the service stops, so none are left behind.
+            var cmd = new StringBuilder($"\"{exe}\" --unlock-helper {Environment.ProcessId}");
             var si = new STARTUPINFO { cb = System.Runtime.InteropServices.Marshal.SizeOf<STARTUPINFO>(), lpDesktop = @"winsta0\default" };
             if (!CreateProcessAsUser(dup, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_NO_WINDOW,
                     IntPtr.Zero, Path.GetDirectoryName(exe), ref si, out var pi))
