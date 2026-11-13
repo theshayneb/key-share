@@ -24,7 +24,7 @@ internal sealed class MainForm : Form
     private readonly Label _lblUnlock = new() { AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(22, 0, 3, 3), Anchor = AnchorStyles.Left };
     private readonly LinkLabel _lnkUpdateUnlock = new() { Text = "Update it", AutoSize = true, Visible = false, Margin = new Padding(0, 0, 3, 3), Anchor = AnchorStyles.Left };
     private readonly System.Windows.Forms.Timer _unlockTimer = new() { Interval = 10_000 };
-    private bool _unlockOutOfDate;
+    private volatile bool _unlockOutOfDate;
     private readonly CheckBox _cbUnlock = new()
     {
         Text = "Let the other PC type on this PC's lock screen (asks for admin once)",
@@ -434,7 +434,6 @@ internal sealed class MainForm : Form
     private async Task CheckUnlockVersionAsync()
     {
         _unlockOutOfDate = await Task.Run(UnlockService.IsOutOfDate);
-        if (_unlockOutOfDate) Log.Info("Lock-screen helper is older than this KeyShare");
         RefreshUnlockStatus();
     }
 
@@ -447,7 +446,12 @@ internal sealed class MainForm : Form
             _lnkUpdateUnlock.Visible = false;
             return;
         }
-        _ = Task.Run(InputSink.TryConnect).ContinueWith(t => OnUi(() =>
+        // Checks again on every refresh, so the message clears as soon as the service runs this version.
+        _ = Task.Run(() =>
+        {
+            _unlockOutOfDate = UnlockService.IsOutOfDate();
+            return InputSink.TryConnect();
+        }).ContinueWith(t => OnUi(() =>
         {
             bool ready = t.IsCompletedSuccessfully && t.Result;
             _lnkUpdateUnlock.Visible = _unlockOutOfDate;

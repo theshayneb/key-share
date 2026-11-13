@@ -22,7 +22,16 @@ internal static class UnlockService
 {
     public const string Name = "KeyShareUnlock";
     private static string InstallDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "KeyShare");
-    private static string InstalledExe => Path.Combine(InstallDir, "KeyShare.exe");
+
+    // Each version goes in its own file, named after its contents (KeyShare-1a2b3c4d.exe),
+    // and the service is pointed at it. Nothing ever has to overwrite or move a file
+    // that's in use (by a helper, a virus scanner or anything else), and "is the
+    // service up to date?" is a name comparison.
+    private static readonly Lazy<string> MyFileName = new(() =>
+    {
+        using var f = File.OpenRead(Environment.ProcessPath!);
+        return "KeyShare-" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(f), 0, 4).ToLowerInvariant() + ".exe";
+    });
 
     public static bool IsInstalled()
     {
@@ -30,19 +39,35 @@ internal static class UnlockService
         catch { return false; }
     }
 
-    /// <summary>Is the copy the service runs older (different) than this exe? Slow: reads both files.</summary>
+    /// <summary>The exe the installed service runs, from its registry entry; null if none.</summary>
+    public static string? ServiceExe()
+    {
+        using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\{Name}");
+        if (key?.GetValue("ImagePath") is not string image) return null;
+        image = Environment.ExpandEnvironmentVariables(image.Trim());
+        if (image.StartsWith('"'))
+        {
+            int end = image.IndexOf('"', 1);
+            return end > 1 ? image[1..end] : null;
+        }
+        int space = image.IndexOf(" --", StringComparison.Ordinal);
+        return space > 0 ? image[..space] : image;
+    }
+
+    private static string? _lastCheck;
+
+    /// <summary>Does the installed service run a different version from this exe?</summary>
     public static bool IsOutOfDate()
     {
         try
         {
-            if (!IsInstalled() || !File.Exists(InstalledExe)) return false;
-            var mine = new FileInfo(Environment.ProcessPath!);
-            var theirs = new FileInfo(InstalledExe);
-            if (string.Equals(mine.FullName, theirs.FullName, StringComparison.OrdinalIgnoreCase)) return false;
-            if (mine.Length != theirs.Length) return true;
-            using var a = File.OpenRead(mine.FullName);
-            using var b = File.OpenRead(theirs.FullName);
-            return !System.Security.Cryptography.SHA256.HashData(a).AsSpan().SequenceEqual(System.Security.Cryptography.SHA256.HashData(b));
+            if (!IsInstalled()) return false;
+            string? exe = ServiceExe();
+            bool outOfDate = exe == null || !string.Equals(Path.GetFileName(exe), MyFileName.Value, StringComparison.OrdinalIgnoreCase);
+            string line = $"Lock-screen helper version check: service runs {Path.GetFileName(exe ?? "?")}, this is {MyFileName.Value} ({(outOfDate ? "out of date" : "up to date")})";
+            if (line != _lastCheck) Log.Info(line); // only when it changes, so the 10-second re-check doesn't fill the log
+            _lastCheck = line;
+            return outOfDate;
         }
         catch (Exception ex)
         {
@@ -59,13 +84,15 @@ internal static class UnlockService
         try
         {
             using var p = Process.Start(psi);
-            if (p == null) return false;
+            if (p == null) { Log.Info($"Running {argument} as administrator: no process came back"); return false; }
             await p.WaitForExitAsync();
+            Log.Info($"Running {argument} as administrator finished with code {p.ExitCode}");
             return p.ExitCode == 0;
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            return false; // the user said no at the UAC prompt
+            Log.Info($"Running {argument} as administrator: cancelled at the UAC prompt");
+            return false;
         }
     }
 
@@ -78,26 +105,34 @@ internal static class UnlockService
             StopIfRunning();
             StopLeftoverHelpers();
             Directory.CreateDirectory(InstallDir);
-            DeleteOldCopies();
-            string source = Environment.ProcessPath!;
-            if (!string.Equals(Path.GetFullPath(source), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase))
-                ReplaceFile(source, InstalledExe);
 
-            string binPath = $"binPath= \"\\\"{InstalledExe}\\\" --service\"";
+            string target = Path.Combine(InstallDir, MyFileName.Value);
+            if (!File.Exists(target) || new FileInfo(target).Length != new FileInfo(Environment.ProcessPath!).Length)
+            {
+                string temp = target + ".partial";
+                File.Copy(Environment.ProcessPath!, temp, overwrite: true);
+                File.Move(temp, target, overwrite: true);
+            }
+
+            string binPath = $"binPath= \"\\\"{target}\\\" --service\"";
             if (IsInstalled()) Sc($"config {Name} {binPath} start= auto");
             else Sc($"create {Name} {binPath} start= auto DisplayName= \"KeyShare unlock helper\"");
             Sc($"description {Name} \"Lets KeyShare type on this PC's lock screen. Turn it off in KeyShare.\"");
             Sc($"failure {Name} reset= 86400 actions= restart/5000/restart/5000/restart/60000");
 
+            DeleteOtherCopies(keep: target);
+
             using var sc = new ServiceController(Name);
             sc.Start();
             sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
-            Log.Info("Unlock service installed");
+            Log.Info($"Unlock service installed ({MyFileName.Value})");
+            Log.Flush();
             return 0;
         }
         catch (Exception ex)
         {
             Log.Error("Installing unlock service", ex);
+            Log.Flush();
             MessageBox.Show("Couldn't set up lock-screen typing:\n\n" + ex.Message, "KeyShare", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -110,16 +145,16 @@ internal static class UnlockService
             StopIfRunning();
             StopLeftoverHelpers();
             if (IsInstalled()) Sc($"delete {Name}");
-            DeleteOldCopies();
-            if (File.Exists(InstalledExe) && !TryDelete(InstalledExe, attempts: 8))
-                ScheduleDeleteAtRestart(InstalledExe); // still in use: Windows removes it at the next restart
-            try { Directory.Delete(InstallDir); } catch { }
+            DeleteOtherCopies(keep: null);
+            try { Directory.Delete(InstallDir); } catch { } // fails harmlessly if a copy is waiting for a restart
             Log.Info("Unlock service removed");
+            Log.Flush();
             return 0;
         }
         catch (Exception ex)
         {
             Log.Error("Removing unlock service", ex);
+            Log.Flush();
             MessageBox.Show("Couldn't remove lock-screen typing:\n\n" + ex.Message, "KeyShare", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -132,26 +167,21 @@ internal static class UnlockService
         if (sc.Status is ServiceControllerStatus.Stopped) return;
         try { sc.Stop(); } catch (InvalidOperationException) { }
         sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(20));
-        Thread.Sleep(500); // let the helper process exit and release the exe
     }
 
-    /// <summary>
-    /// Ends any helper still running from the installed copy. Normally stopping
-    /// the service ends its helper, but one can be left behind (for example after
-    /// the service restarted), and it keeps the exe locked.
-    /// </summary>
+    /// <summary>Ends any KeyShare process still running from the install folder (a helper left behind).</summary>
     private static void StopLeftoverHelpers()
     {
         try { Process.EnterDebugMode(); } catch { } // lets an administrator end SYSTEM processes
-        foreach (var p in Process.GetProcessesByName("KeyShare"))
+        string dir = Path.GetFullPath(InstallDir).TrimEnd('\\') + "\\";
+        foreach (var p in Process.GetProcesses())
         {
             using (p)
             {
-                if (p.Id == Environment.ProcessId) continue;
+                if (p.Id == Environment.ProcessId || !p.ProcessName.StartsWith("KeyShare", StringComparison.OrdinalIgnoreCase)) continue;
                 string? path = null;
                 try { path = p.MainModule?.FileName; } catch { }
-                if (path == null || !string.Equals(Path.GetFullPath(path), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase))
-                    continue;
+                if (path == null || !Path.GetFullPath(path).StartsWith(dir, StringComparison.OrdinalIgnoreCase)) continue;
                 try
                 {
                     p.Kill();
@@ -166,46 +196,24 @@ internal static class UnlockService
         }
     }
 
-    /// <summary>
-    /// Copies <paramref name="from"/> over <paramref name="to"/>. If something
-    /// still has the old file open, moves it aside first: Windows lets you
-    /// rename a file that's in use, just not overwrite it.
-    /// </summary>
-    private static void ReplaceFile(string from, string to)
-    {
-        for (int i = 0; i < 8; i++)
-        {
-            try { File.Copy(from, to, overwrite: true); return; }
-            catch (IOException) { Thread.Sleep(250); }
-            catch (UnauthorizedAccessException) { Thread.Sleep(250); }
-        }
-        string aside = Path.Combine(InstallDir, $"KeyShare.old-{DateTime.Now:yyyyMMddHHmmss}.exe");
-        File.Move(to, aside);
-        ScheduleDeleteAtRestart(aside);
-        File.Copy(from, to, overwrite: true);
-        Log.Info("Installed copy was in use; moved it aside to replace it");
-    }
-
-    private static void DeleteOldCopies()
+    /// <summary>Removes older copies; any still in use are deleted by Windows at the next restart.</summary>
+    private static void DeleteOtherCopies(string? keep)
     {
         if (!Directory.Exists(InstallDir)) return;
-        foreach (var old in Directory.GetFiles(InstallDir, "KeyShare.old-*.exe")) TryDelete(old, attempts: 1);
-    }
-
-    private static bool TryDelete(string path, int attempts)
-    {
-        for (int i = 0; i < attempts; i++)
+        foreach (var file in Directory.GetFiles(InstallDir, "KeyShare*.exe*"))
         {
-            try { File.Delete(path); return true; }
-            catch (Exception) { Thread.Sleep(250); }
+            if (keep != null && string.Equals(Path.GetFullPath(file), Path.GetFullPath(keep), StringComparison.OrdinalIgnoreCase)) continue;
+            try { File.Delete(file); }
+            catch (Exception)
+            {
+                MoveFileEx(file, null, 4 /* MOVEFILE_DELAY_UNTIL_REBOOT */);
+                Log.Info($"{Path.GetFileName(file)} is in use; Windows will delete it at the next restart");
+            }
         }
-        return false;
     }
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
     private static extern bool MoveFileEx(string existing, string? replacement, int flags);
-
-    private static void ScheduleDeleteAtRestart(string path) => MoveFileEx(path, null, 4 /* MOVEFILE_DELAY_UNTIL_REBOOT */);
 
     private static void Sc(string arguments)
     {

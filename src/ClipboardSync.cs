@@ -181,7 +181,9 @@ internal sealed class ClipboardSync
             if (text != null) obj.SetText(text, TextDataFormat.UnicodeText);
             if (rtf != null) obj.SetText(rtf, TextDataFormat.Rtf);
             if (image != null) obj.SetImage(image);
-            Clipboard.SetDataObject(obj, copy: true, retryTimes: 10, retryDelay: 50);
+            // Another app may have the clipboard open for a moment (clipboard history,
+            // Office, remote desktop…); keep trying for about three seconds.
+            Clipboard.SetDataObject(obj, copy: true, retryTimes: 30, retryDelay: 100);
         }
         finally
         {

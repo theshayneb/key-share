@@ -70,16 +70,18 @@ internal sealed class ClientService : IDisposable
                     catch (WrongCodeException ex)
                     {
                         Status?.Invoke($"{name}: {ex.Message} Check the code.");
+                        LogOnce($"Connect to {name} ({ep}): {ex.Message}");
                         continue;
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
                     {
-                        Log.Info($"Connect to {ep} failed: {ex.Message}");
+                        LogOnce($"Connect to {name} ({ep}) failed: {ex.Message}");
                         Status?.Invoke($"Couldn't connect to {name}: {Short(ex)}");
                         continue;
                     }
 
                     everConnected = true;
+                    _lastLogged = null;
                     Status?.Invoke($"Connected to {link.PeerName}");
                     Log.Info($"Connected to {link.PeerName} ({link.PeerAddress})");
                     link.StallChanged += stalled => Status?.Invoke(stalled
@@ -158,6 +160,16 @@ internal sealed class ClientService : IDisposable
             tcp.Dispose();
             throw;
         }
+    }
+
+    private string? _lastLogged;
+
+    /// <summary>Logs a connection problem once, not on every retry.</summary>
+    private void LogOnce(string message)
+    {
+        if (message == _lastLogged) return;
+        _lastLogged = message;
+        Log.Info(message);
     }
 
     private static string Short(Exception ex) => ex switch
