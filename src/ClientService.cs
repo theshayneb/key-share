@@ -30,10 +30,16 @@ internal sealed class ClientService : IDisposable
         remove => _injector.ArrivedByKey -= value;
     }
 
-    public ClientService(string code, string address)
+    /// <summary>"ip:port|name" of a host that worked, to save for next time.</summary>
+    public event Action<string>? HostRemembered;
+    private (IPEndPoint ep, string name)? _lastGood;
+
+    public ClientService(string code, string address, string lastHost = "")
     {
         _code = code;
         _address = address.Trim();
+        var parts = lastHost.Split('|', 2);
+        if (parts.Length == 2 && IPEndPoint.TryParse(parts[0], out var ep)) _lastGood = (ep, parts[1]);
     }
 
     public void Start() => _ = Task.Run(() => RunAsync(_cts.Token));
@@ -51,57 +57,34 @@ internal sealed class ClientService : IDisposable
         {
             try
             {
-                var targets = await FindTargetsAsync(ct);
-                if (targets.Count == 0)
+                // Go straight back to the address that worked last time. It's
+                // quicker than searching the network, and works even where the
+                // search doesn't (some VPNs and routers block it).
+                bool done = false;
+                if (_address.Length == 0 && _lastGood is { } last)
                 {
-                    Status?.Invoke(_address.Length > 0
-                        ? $"Can't find {_address}. Retrying…"
-                        : "Looking for the host… (is it sharing, and on the same network?)");
+                    var r = await SessionAsync(last.ep, last.name, TimeSpan.FromSeconds(3), ct);
+                    if (r == Outcome.Connected) { everConnected = true; done = true; }
                 }
 
-                foreach (var (ep, name) in targets)
+                if (!done)
                 {
-                    Status?.Invoke($"Connecting to {name}…");
-                    SecureLink link;
-                    try
+                    var targets = await FindTargetsAsync(ct);
+                    if (targets.Count == 0)
                     {
-                        link = await ConnectAsync(ep, ct);
+                        Status?.Invoke(_address.Length > 0
+                            ? $"Can't find {_address}. Retrying…"
+                            : "Looking for the host… (is it sharing, and on the same network?)");
                     }
-                    catch (WrongCodeException ex)
+                    foreach (var (ep, name) in targets)
                     {
-                        Status?.Invoke($"{name}: {ex.Message} Check the code.");
-                        LogOnce($"Connect to {name} ({ep}): {ex.Message}");
-                        continue;
+                        if (_lastGood is { } lg && lg.ep.Equals(ep)) continue; // just tried it
+                        if (await SessionAsync(ep, name, TimeSpan.FromSeconds(5), ct) == Outcome.Connected)
+                        {
+                            everConnected = true;
+                            break;
+                        }
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-                    {
-                        LogOnce($"Connect to {name} ({ep}) failed: {ex.Message}");
-                        Status?.Invoke($"Couldn't connect to {name}: {Short(ex)}");
-                        continue;
-                    }
-
-                    everConnected = true;
-                    _lastLogged = null;
-                    Status?.Invoke($"Connected to {link.PeerName}");
-                    Log.Info($"Connected to {link.PeerName} ({link.PeerAddress})");
-                    link.StallChanged += stalled => Status?.Invoke(stalled
-                        ? $"The connection to {link.PeerName} is stuck (Wi-Fi or VPN?). Waiting for it…"
-                        : $"Connected to {link.PeerName}");
-                    _link = link;
-                    _injector.RequestReturn = along => link.Send(Protocol.Return(along));
-                    link.Start(m =>
-                    {
-                        if (m[0] == (byte)Msg.Clip) ClipboardChunk?.Invoke(m);
-                        else if (m[0] == (byte)Msg.Activity) Power.OtherPcActive();
-                        else _injector.Handle(m);
-                    });
-                    await link.Completion;
-                    _link = null;
-                    _injector.ReleaseAll();
-                    if (ct.IsCancellationRequested) return;
-                    Log.Info($"Disconnected from {link.PeerName}");
-                    Status?.Invoke($"Lost connection to {link.PeerName}. Reconnecting…");
-                    break;
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -114,9 +97,60 @@ internal sealed class ClientService : IDisposable
                 Status?.Invoke($"Error: {Short(ex)}. Retrying…");
             }
 
-            try { await Task.Delay(everConnected ? 1000 : 2000, ct); }
+            try { await Task.Delay(everConnected ? 300 : 2000, ct); }
             catch (OperationCanceledException) { return; }
         }
+    }
+
+    private enum Outcome { CouldNotConnect, Connected }
+
+    /// <summary>Connects to one host and runs the session until it ends.</summary>
+    private async Task<Outcome> SessionAsync(IPEndPoint ep, string name, TimeSpan timeout, CancellationToken ct)
+    {
+        Status?.Invoke($"Connecting to {name}…");
+        SecureLink link;
+        try
+        {
+            link = await ConnectAsync(ep, timeout, ct);
+        }
+        catch (WrongCodeException ex)
+        {
+            Status?.Invoke($"{name}: {ex.Message} Check the code.");
+            LogOnce($"Connect to {name} ({ep}): {ex.Message}");
+            return Outcome.CouldNotConnect;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            LogOnce($"Connect to {name} ({ep}) failed: {ex.Message}");
+            Status?.Invoke($"Couldn't connect to {name}: {Short(ex)}");
+            return Outcome.CouldNotConnect;
+        }
+
+        _lastLogged = null;
+        _lastGood = (ep, link.PeerName);
+        HostRemembered?.Invoke($"{ep}|{link.PeerName}");
+        Status?.Invoke($"Connected to {link.PeerName}");
+        Log.Info($"Connected to {link.PeerName} ({link.PeerAddress})");
+        link.StallChanged += stalled => Status?.Invoke(stalled
+            ? $"The connection to {link.PeerName} is stuck (Wi-Fi or VPN?). Waiting for it…"
+            : $"Connected to {link.PeerName}");
+        _link = link;
+        _injector.RequestReturn = along => link.Send(Protocol.Return(along));
+        link.Start(m =>
+        {
+            if (m[0] == (byte)Msg.Clip) ClipboardChunk?.Invoke(m);
+            else if (m[0] == (byte)Msg.Activity) Power.OtherPcActive();
+            else _injector.Handle(m);
+        });
+        await link.Completion;
+        _link = null;
+        _injector.ReleaseAll();
+        if (!ct.IsCancellationRequested)
+        {
+            Log.Info($"Disconnected from {link.PeerName}");
+            Status?.Invoke($"Lost connection to {link.PeerName}. Reconnecting…");
+        }
+        return Outcome.Connected;
     }
 
     private async Task<List<(IPEndPoint, string)>> FindTargetsAsync(CancellationToken ct)
@@ -145,13 +179,13 @@ internal sealed class ClientService : IDisposable
         return list;
     }
 
-    private async Task<SecureLink> ConnectAsync(IPEndPoint ep, CancellationToken ct)
+    private async Task<SecureLink> ConnectAsync(IPEndPoint ep, TimeSpan timeoutAfter, CancellationToken ct)
     {
         var tcp = new TcpClient(AddressFamily.InterNetwork);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            timeout.CancelAfter(timeoutAfter);
             await tcp.ConnectAsync(ep, timeout.Token);
             return await SecureLink.EstablishAsync(tcp, _code, isHost: false, timeout.Token);
         }

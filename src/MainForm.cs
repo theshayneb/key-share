@@ -332,7 +332,13 @@ internal sealed class MainForm : Form
         _settings.Running = true;
         _settings.Save();
 
-        var client = new ClientService(code, _settings.JoinAddress);
+        var client = new ClientService(code, _settings.JoinAddress, _settings.JoinLastHost);
+        client.HostRemembered += host => OnUi(() =>
+        {
+            if (_settings.JoinLastHost == host) return;
+            _settings.JoinLastHost = host;
+            _settings.Save();
+        });
         client.Status += s => OnUi(() => SetStatus(s));
         client.ClipboardChunk += ReceiveClipboard;
         client.ArrivedByKey += () => OnUi(CursorLocator.ShowAtCursor);

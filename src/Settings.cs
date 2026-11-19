@@ -10,6 +10,8 @@ internal sealed class Settings
     public Side OtherSide { get; set; } = Side.Right;
     public string JoinCode { get; set; } = "";
     public string JoinAddress { get; set; } = "";
+    /// <summary>"ip:port|name" of the host this PC last connected to, tried first when reconnecting.</summary>
+    public string JoinLastHost { get; set; } = "";
     public bool ShareClipboard { get; set; } = true;
     public bool StayAwakeTogether { get; set; } = true;
     public int SwitchMods { get; set; } = SwitchKey.Default.Mods;

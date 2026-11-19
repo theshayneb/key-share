@@ -24,7 +24,15 @@ internal sealed class SecureLink : IDisposable
     private static readonly byte[] Magic = "KSH3"u8.ToArray();
     private const int TagSize = 16;
     private const int MaxFrame = ushort.MaxValue;
-    private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(8);
+    /// <summary>
+    /// Silence this long means the other PC is really gone (asleep, off the
+    /// network). Wi-Fi often goes quiet for several seconds and TCP carries on
+    /// afterwards, so this is generous; shorter gaps are handled by the stall
+    /// detection instead, without dropping the connection.
+    /// </summary>
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(45);
+    /// <summary>Mouse movement older than this when it finally goes out is dropped, so the pointer doesn't lurch after a hiccup.</summary>
+    private const long StaleMoveMs = 500;
     private static readonly TimeSpan PingEvery = TimeSpan.FromSeconds(1);
     /// <summary>No answer to our pings for this long: the network is stuck (Wi-Fi, VPN…).</summary>
     private static readonly TimeSpan StallAfter = TimeSpan.FromSeconds(2.5);
@@ -34,7 +42,10 @@ internal sealed class SecureLink : IDisposable
     private readonly AesGcm _enc, _dec;
     private readonly byte[] _sendNonce = new byte[12], _recvNonce = new byte[12];
     private ulong _sendCounter, _recvCounter;
-    private readonly Channel<byte[]> _outbox = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<(byte[] msg, long queuedAt)> _outbox = Channel.CreateUnbounded<(byte[], long)>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly long[] _pingSentAt = new long[64];
+    private long _worstDelay, _delayWindowStart = Environment.TickCount64;
+    private int _droppedMoves;
     // Clipboard chunks. Sent only when no input is waiting, so a big copy never delays the mouse.
     private readonly Channel<byte[]> _bulk = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
     private readonly CancellationTokenSource _cts = new();
@@ -183,7 +194,7 @@ internal sealed class SecureLink : IDisposable
     // ---- Running link ---------------------------------------------------
 
     /// <summary>Queue a message. Safe to call from any thread, never blocks.</summary>
-    public void Send(byte[] message) => _outbox.Writer.TryWrite(message);
+    public void Send(byte[] message) => _outbox.Writer.TryWrite((message, Environment.TickCount64));
 
     /// <summary>Queue a low-priority message, such as a clipboard chunk.</summary>
     public void SendBulk(byte[] message) => _bulk.Writer.TryWrite(message);
@@ -210,7 +221,7 @@ internal sealed class SecureLink : IDisposable
                 Interlocked.Exchange(ref _lastReceive, Environment.TickCount64);
                 if (msg.Length == 0) continue;
                 if (msg[0] == (byte)Msg.Ping) { Send(Protocol.Pong(msg)); continue; }
-                if (msg[0] == (byte)Msg.Pong) { Interlocked.Exchange(ref _lastPong, Environment.TickCount64); continue; }
+                if (msg[0] == (byte)Msg.Pong) { Interlocked.Exchange(ref _lastPong, Environment.TickCount64); NotePong(msg); continue; }
                 try { onMessage(msg); }
                 catch (Exception ex) { Log.Error("Handling message", ex); }
             }
@@ -234,7 +245,12 @@ internal sealed class SecureLink : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 // Input first, always; then one clipboard chunk; then check input again.
-                if (input.TryRead(out var m)) { await WriteFrameAsync(m, ct); continue; }
+                if (input.TryRead(out var m))
+                {
+                    if (m.msg[0] == (byte)Msg.Move && Environment.TickCount64 - m.queuedAt > StaleMoveMs) { _droppedMoves++; continue; }
+                    await WriteFrameAsync(m.msg, ct);
+                    continue;
+                }
                 if (bulk.TryRead(out var b)) { await WriteFrameAsync(b, ct); continue; }
 
                 using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -257,6 +273,29 @@ internal sealed class SecureLink : IDisposable
         }
     }
 
+    /// <summary>Notes how long a ping took to come back.</summary>
+    private void NotePong(byte[] pong)
+    {
+        if (pong.Length < 5) return;
+        uint n = BinaryPrimitives.ReadUInt32LittleEndian(pong.AsSpan(1));
+        long sent = _pingSentAt[n & 63];
+        if (sent == 0) return;
+        long delay = Environment.TickCount64 - sent;
+        if (delay > Interlocked.Read(ref _worstDelay)) Interlocked.Exchange(ref _worstDelay, delay);
+    }
+
+    /// <summary>Once a minute, logs the network's worst delay if it was noticeable (helps spot Wi-Fi trouble).</summary>
+    private void ReportDelays(long now)
+    {
+        if (now - _delayWindowStart < 60_000) return;
+        long worst = Interlocked.Exchange(ref _worstDelay, 0);
+        if (worst >= 300 || _droppedMoves > 0)
+            Log.Info($"Network to {PeerName}: worst delay in the last minute {worst} ms" +
+                     (_droppedMoves > 0 ? $", {_droppedMoves} late mouse moves skipped" : ""));
+        _droppedMoves = 0;
+        _delayWindowStart = now;
+    }
+
     private async Task WatchdogAsync(CancellationToken ct)
     {
         try
@@ -269,7 +308,10 @@ internal sealed class SecureLink : IDisposable
                 long now = Environment.TickCount64;
                 if (now - lastPing >= PingEvery.TotalMilliseconds)
                 {
-                    Send(Protocol.Ping(unchecked(++_pingNumber))); // ahead of any queued clipboard data
+                    uint n = unchecked(++_pingNumber);
+                    _pingSentAt[n & 63] = now;
+                    Send(Protocol.Ping(n)); // ahead of any queued clipboard data
+                    ReportDelays(now);
                     lastPing = now;
                 }
 
@@ -283,7 +325,7 @@ internal sealed class SecureLink : IDisposable
 
                 if (now - Interlocked.Read(ref _lastReceive) > IdleTimeout.TotalMilliseconds)
                 {
-                    Log.Info($"Link to {PeerName} timed out");
+                    Log.Info($"Link to {PeerName} timed out (nothing heard for {IdleTimeout.TotalSeconds:0} s)");
                     return;
                 }
             }

@@ -116,6 +116,26 @@ SYSTEM account can. So this option installs a small Windows service named
   (one admin prompt) so the service gets the new version too.
 - Untick the box to remove the service and its files.
 
+## If it keeps disconnecting
+
+KeyShare rides out short network gaps without dropping the connection. Only
+45 seconds of silence counts as a disconnect, and when it does reconnect it
+goes straight back to the last address that worked. If the log
+(`%APPDATA%\KeyShare\log.txt`) still shows lines like "Network to …: worst
+delay … ms" or "stalled", the network itself is slow to deliver, which is
+almost always Wi-Fi power saving on a laptop:
+
+- Plug in a network cable if you can. Wired is far steadier than Wi-Fi.
+- Turn off power saving for the Wi-Fi adapter: open Device Manager, then
+  Network adapters, then your Wi-Fi adapter, then Properties, then Power
+  Management, and untick "Allow the computer to turn off this device to save
+  power". On the Advanced tab, set any "Power Saving Mode" or "MIMO Power
+  Save" option to off or maximum performance.
+- In Settings, then System, then Power, set Power mode to "Best performance"
+  while plugged in.
+- A VPN on either PC can add delay. If yours has a "local network access" or
+  split-tunnel setting, turn it on.
+
 ## If the mouse freezes
 
 KeyShare's keyboard and mouse hook runs on its own high-priority thread, and the
