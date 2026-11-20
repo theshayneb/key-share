@@ -14,6 +14,7 @@ internal sealed class Settings
     public string JoinLastHost { get; set; } = "";
     public bool ShareClipboard { get; set; } = true;
     public bool StayAwakeTogether { get; set; } = true;
+    public bool FixTaskbarOnDisplayChange { get; set; } = true;
     public int SwitchMods { get; set; } = SwitchKey.Default.Mods;
     public int SwitchVk { get; set; } = SwitchKey.Default.Vk;
     public int SwitchButton { get; set; } = SwitchKey.Default.Button;

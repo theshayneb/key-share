@@ -52,6 +52,13 @@ Then:
 - The edge doesn't switch while a mouse button is held, so dragging a window to
   snap it still works.
 - The other PC's own keyboard and mouse keep working.
+- **Taskbar icons after a KVM switch:** Windows 11 sometimes loses the taskbar
+  icons when monitors come and go. When the monitors change, KeyShare waits
+  3 seconds, then switches "Show badges on taskbar apps" off and back on, the
+  same trick as doing it by hand in Taskbar settings, which makes the icons
+  reappear. The setting ends where it started. Turn this off with **Bring back
+  missing taskbar icons…**, or run it by hand from the tray menu with **Refresh
+  taskbar icons**.
 - **Clipboard:** copy on either PC and paste on the other. Text, formatted text
   (RTF, for Word and Outlook) and images are shared, up to 32 MB. Files are not.
   Turn it off with **Share clipboard**. Passwords copied from password managers

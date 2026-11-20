@@ -34,6 +34,9 @@ internal sealed class MainForm : Form
     private readonly Label _lblStatus = new() { AutoSize = true, MaximumSize = new Size(440, 0), Margin = new Padding(3, 10, 3, 6) };
     private readonly CheckBox _cbStartup = new() { Text = "Start with Windows", AutoSize = true };
     private readonly CheckBox _cbClipboard = new() { Text = "Share clipboard (text and images)", AutoSize = true };
+    private readonly CheckBox _cbTaskbar = new() { Text = "Bring back missing taskbar icons when monitors change (KVM switch)", AutoSize = true };
+    // KVM switches make monitors disappear and reappear in several steps; act once it's quiet.
+    private readonly System.Windows.Forms.Timer _displayTimer = new() { Interval = 3000 };
     private readonly CheckBox _cbAwake = new() { Text = "Keep both PCs awake while I'm using either one", AutoSize = true };
     private readonly System.Windows.Forms.Timer _activityTimer = new() { Interval = (int)Power.PingEvery.TotalMilliseconds };
 
@@ -80,6 +83,7 @@ internal sealed class MainForm : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open KeyShare", null, (_, _) => ShowFromTray());
         _menuSwitch = menu.Items.Add("Switch PC", null, (_, _) => _capture?.Toggle());
+        menu.Items.Add("Refresh taskbar icons", null, (_, _) => _ = TaskbarFixer.RefreshAsync("from the tray menu"));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Close());
         _tray.ContextMenuStrip = menu;
@@ -119,6 +123,19 @@ internal sealed class MainForm : Form
 
         SystemEvents.SessionSwitch += OnSessionSwitch;
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
+
+        _cbTaskbar.Checked = _settings.FixTaskbarOnDisplayChange;
+        _cbTaskbar.CheckedChanged += (_, _) =>
+        {
+            _settings.FixTaskbarOnDisplayChange = _cbTaskbar.Checked;
+            _settings.Save();
+        };
+        _displayTimer.Tick += (_, _) =>
+        {
+            _displayTimer.Stop();
+            if (_settings.FixTaskbarOnDisplayChange) _ = TaskbarFixer.RefreshAsync("monitors changed");
+        };
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
         _rbHost.CheckedChanged += (_, _) => { if (_rbHost.Checked) SwitchRole(true); };
         _rbJoin.CheckedChanged += (_, _) => { if (_rbJoin.Checked) SwitchRole(false); };
@@ -180,6 +197,7 @@ internal sealed class MainForm : Form
         root.Controls.Add(_lblStatus);
         root.Controls.Add(_cbClipboard);
         root.Controls.Add(_cbAwake);
+        root.Controls.Add(_cbTaskbar);
         root.Controls.Add(_cbStartup);
         root.Controls.Add(_lblTip);
         Controls.Add(root);
@@ -523,6 +541,13 @@ internal sealed class MainForm : Form
         _hotKeyRegistered = false;
     }
 
+    // Arrives on SystemEvents' own thread; restarts the settle timer on the window thread.
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e) => OnUi(() =>
+    {
+        _displayTimer.Stop();
+        _displayTimer.Start();
+    });
+
     private void ReinstallHooks()
     {
         try { _capture?.Reinstall(); }
@@ -684,6 +709,7 @@ internal sealed class MainForm : Form
         _tray.Dispose();
         SystemEvents.SessionSwitch -= OnSessionSwitch;
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         base.OnFormClosing(e);
     }
 
